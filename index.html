@@ -135,10 +135,14 @@ textarea{min-height:110px;resize:vertical}
  * A résztvevők NEM kapnak hozzáférést a privát Google Táblázatodhoz.
  */
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyvlhKupwsChKfQHa7rH90J_0G2lbyUkShBeV3S28kdET6e-san9XytrRpSLsRo_iGf/exec';
+// Az ingyenes Cloudflare Worker URL-je. Amíg nincs beállítva, a régi kapcsolat működik.
+const WORKER_URL = 'IDE_MASOLD_BE_A_CLOUDFLARE_WORKER_URL_T';
 const YEAR = 2026;
 const LOCAL_HOST = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\]|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3})$/i.test(location.hostname);
 const IS_DEMO = location.protocol === 'file:' || LOCAL_HOST || new URLSearchParams(location.search).get('demo') === '1';
 const HAS_BACKEND = /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(APPS_SCRIPT_URL);
+const HAS_WORKER = /^https:\/\/[a-z0-9.-]+\.workers\.dev\/?$/i.test(WORKER_URL) || /^https:\/\/[a-z0-9.-]+\/api\/?$/i.test(WORKER_URL);
+console.info('Advent data mode:', HAS_WORKER ? 'Worker proxy' : HAS_BACKEND ? 'Google Apps Script' : 'offline demo');
 const SAMPLES = {
   1: {title:'Γράψε μια πρόταση', question:'Γράψε μια πρόταση με τις λέξεις «καιρός» και «αύριο».', help:'Schreibe einen Satz mit den Wörtern „Wetter“ und „morgen“.', image:''},
   2: {title:'Λεξιλόγιο',question:'Τι σημαίνει η φράση «Καλημέρα, φίλε μου!»;', help:'Was bedeutet der Satz „Guten Morgen, mein Freund!“?',image:''},
@@ -205,12 +209,26 @@ function jsonp(params,timeout=19000){
  });
 }
 
+// A Cloudflare Worker elkülöníti a látogatók Google-fiókját az Apps Scripttől.
+async function apiGet(params,timeout=19000){
+ if(!HAS_WORKER)return jsonp(params,timeout);
+ const url=new URL(WORKER_URL);
+ Object.entries(params).forEach(([key,val])=>url.searchParams.set(key,String(val)));
+ const abort=new AbortController();
+ const timer=setTimeout(()=>abort.abort(),timeout);
+ try{
+  const r=await fetch(url.toString(),{method:'GET',mode:'cors',credentials:'omit',cache:'no-store',signal:abort.signal});
+  if(!r.ok)throw new Error('API GET HTTP '+r.status);
+  return await r.json();
+ }finally{clearTimeout(timer);}
+}
+
 async function loadTask(day){
- if(!HAS_BACKEND){
+ if(!HAS_BACKEND && !HAS_WORKER){
   if(IS_DEMO && SAMPLES[day])return {ok:true,demo:true,task:SAMPLES[day],offline:true};
   return {ok:false,error:'NOT_CONFIGURED'};
  }
- return jsonp({action:'task',day,demo:IS_DEMO?'1':'0'});
+ return apiGet({action:'task',day,demo:IS_DEMO?'1':'0'});
 }
 
 async function openDay(day){
@@ -297,7 +315,7 @@ function createReceipt(){
 }
 function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
 async function receiptSaved(receipt){
- try{const response=await jsonp({action:'receipt',receipt},13000);return !!(response?.ok&&response.saved);}catch(_){return false;}
+ try{const response=await apiGet({action:'receipt',receipt},13000);return !!(response?.ok&&response.saved);}catch(_){return false;}
 }
 async function pollReceipt(receipt){
  for(const pause of [900,1600,2500,3500,4500]){
@@ -307,6 +325,20 @@ async function pollReceipt(receipt){
  return false;
 }
 async function submitWithVerification(payload){
+  // A Worker JSON választ ad, így valódi visszaigazolást kapunk CORS-probléma nélkül.
+  if(HAS_WORKER){
+   const abort=new AbortController();
+   const timer=setTimeout(()=>abort.abort(),26000);
+   try{
+    const response=await fetch(WORKER_URL,{method:'POST',mode:'cors',credentials:'omit',
+      headers:{'Content-Type':'text/plain;charset=UTF-8'},
+      body:JSON.stringify(payload),signal:abort.signal});
+    if(response.ok){const result=await response.json();if(result?.ok&&result.saved)return true;}
+   }catch(_){/* A kérés akár meg is érkezhetett: ellenőrizzük az azonosítót. */}
+   finally{clearTimeout(timer);}
+   return await pollReceipt(payload.receipt);
+  }
+  // Régi JSONP-útvonal: megtartva helyi teszteléshez és visszaálláshoz.
  // no-cors POST can have an opaque HTTP response; NEVER treat that as proof of success.
  try{
   await fetch(APPS_SCRIPT_URL,{
